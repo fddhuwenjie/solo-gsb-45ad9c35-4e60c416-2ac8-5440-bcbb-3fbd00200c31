@@ -22,6 +22,8 @@ from .models import (
     DecodeResult,
     IngestRequest,
     IngestResponse,
+    InvalidateRequest,
+    InvalidatedTrackPoint,
     MessageData,
     ReviewBatch,
     ReviewBatchSummary,
@@ -59,6 +61,10 @@ app = FastAPI(
         "of the latest position and static/voyage messages and an append-only "
         "position track (every stored type 1/2/3 report, including late "
         "observations), queryable via GET /vessels and GET /tracks. "
+        "A stored track point that turns out to be a misreport can be "
+        "marked invalid via POST /tracks/invalidate: it disappears from "
+        "GET /tracks, the position snapshot falls back to the latest "
+        "valid point, and the point can never be re-activated. "
         "Ambiguous batches can be stored via POST /reviews "
         "for manual review; a human picks one listed candidate per ambiguous "
         "pool and POST /reviews/{batch_id}/resolve applies the selection "
@@ -284,6 +290,69 @@ def get_track(source_id: str, mmsi: int):
         )
     return VesselTrack(
         source_id=source_id, mmsi=mmsi, points=store.get_track(source_id, mmsi)
+    )
+
+
+@app.post(
+    "/tracks/invalidate",
+    response_model=InvalidatedTrackPoint,
+    responses={
+        200: {
+            "description": (
+                "Point marked invalid; a repeated marking returns the "
+                "first record unchanged."
+            )
+        },
+        404: {
+            "description": (
+                "No track point stored for the given "
+                "(source_id, MMSI, observed_at)."
+            )
+        },
+        422: {"description": "Request body invalid."},
+    },
+    tags=["snapshots"],
+    description=(
+        "Mark one stored track point as a misreport, by its "
+        "(source_id, MMSI, observed_at) key, and record the reason. The "
+        "point disappears from GET /tracks; when the GET /vessels "
+        "position snapshot is exactly this point, it falls back to the "
+        "latest valid point of the same vessel (or the position part is "
+        "removed when none remains — the static part is kept). "
+        "Invalidating an older point never rolls back a newer valid "
+        "snapshot, and a later /ingest or review resolution at the same "
+        "observed_at can neither re-activate the point nor write it back "
+        "into the snapshot. Marking, track visibility and the snapshot "
+        "change commit atomically and survive restarts. Repeating the "
+        "marking returns the first record and never changes the reason."
+    ),
+)
+def invalidate_track_point(request: InvalidateRequest):
+    store = get_store()
+    observed_at = normalize_observed_at(request.observed_at)
+    record = store.invalidate_point(
+        source_id=request.source_id,
+        mmsi=request.mmsi,
+        observed_at=observed_at,
+        reason=request.reason,
+        invalidated_at=normalize_observed_at(datetime.now(timezone.utc)),
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no track point stored for source '{request.source_id}', "
+                f"MMSI {request.mmsi} at {observed_at}"
+            ),
+        )
+    point, reason, invalidated_at = record
+    return InvalidatedTrackPoint(
+        source_id=request.source_id,
+        mmsi=request.mmsi,
+        observed_at=point.observed_at,
+        reason=reason,
+        invalidated_at=_parse_observed_at(invalidated_at),
+        point=point,
     )
 
 

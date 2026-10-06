@@ -249,6 +249,62 @@ class VesselTrack(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Track point invalidation (misreports)
+# ---------------------------------------------------------------------------
+
+class InvalidateRequest(BaseModel):
+    """Mark one stored track point as a misreport (false position report).
+
+    The point is identified by its ``(source_id, MMSI, observed_at)`` key —
+    exactly the key ``GET /tracks`` points are stored under.
+    """
+
+    source_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="Receiver/source identifier of the point.",
+        examples=["ais-receiver-1"],
+    )
+    mmsi: int = Field(..., description="MMSI of the vessel.", examples=[366999999])
+    observed_at: datetime = Field(
+        ...,
+        description=(
+            "UTC observation time of the point to invalidate (ISO 8601). "
+            "Naive values are treated as UTC; offsets are converted to UTC."
+        ),
+        examples=["2026-10-05T12:00:00Z"],
+    )
+    reason: str = Field(
+        ..., min_length=1, max_length=512,
+        description="Why the point is considered a misreport; kept with the record.",
+        examples=["shore station reported a false position"],
+    )
+
+    @field_validator("observed_at")
+    @classmethod
+    def _assume_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+
+class InvalidatedTrackPoint(BaseModel):
+    """Record of an invalidated track point, together with the original point.
+
+    A repeated invalidation of the same point returns the first record:
+    ``reason`` and ``invalidated_at`` are the ones stored the first time.
+    """
+
+    source_id: str
+    mmsi: int
+    observed_at: datetime
+    reason: str
+    invalidated_at: datetime = Field(
+        ..., description="UTC time the point was first marked invalid.")
+    point: TrackPoint = Field(
+        ..., description="The original track point as stored before invalidation.")
+
+
+# ---------------------------------------------------------------------------
 # Manual review of ambiguous batches
 # ---------------------------------------------------------------------------
 
