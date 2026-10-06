@@ -1,0 +1,16 @@
+services:
+  ais-decoder:
+    build: .
+    image: ais-nmea-decoder:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # Snapshot SQLite database lives on the named volume below, so
+      # vessel snapshots survive `docker compose restart` / `down` + `up`.
+      AIS_DB_PATH: /data/ais.db
+    volumes:
+      - ais-data:/data
+    restart: unless-stopped
+
+volumes:
+  ais-data:
