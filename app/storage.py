@@ -25,6 +25,16 @@ is opened, each vessel's existing position snapshot is copied in as a
 single starting point (``sentence_index = -1``); no earlier track is
 inferred.
 
+A receiving station can flag a stored point as a false report
+(``POST /tracks/invalidations``): the point is not deleted, but its
+``invalid`` flag, the reason and the invalidation timestamp are stored.
+Invalidated points are hidden from ``GET /tracks``, a later submission at
+the same ``observed_at`` neither reactivates them nor restores them into
+``vessel_state``, and when the flagged point is the live position
+snapshot the snapshot is rewound to the latest still-valid point (or
+removed, while the static/voyage timeline is untouched). Flagging an
+older point never rolls back a newer valid snapshot.
+
 ``review_batch``: one row per manual-review batch created from an ambiguous
 batch of sentences. The original sentences and the full decode outcome
 (including every candidate of every ambiguous pool) are stored as JSON, so
@@ -46,6 +56,7 @@ from .models import (
     TimedPositionReport,
     TimedStaticAndVoyageData,
     TrackPoint,
+    TrackPointInvalidation,
     VesselSnapshot,
 )
 
@@ -72,6 +83,9 @@ CREATE TABLE IF NOT EXISTS vessel_track (
     observed_at    TEXT NOT NULL,
     sentence_index INTEGER NOT NULL,
     data           TEXT NOT NULL,
+    invalid        INTEGER NOT NULL DEFAULT 0 CHECK (invalid IN (0, 1)),
+    invalid_reason TEXT,
+    invalidated_at TEXT,
     PRIMARY KEY (source_id, mmsi, observed_at)
 ) WITHOUT ROWID;
 
@@ -86,6 +100,20 @@ CREATE TABLE IF NOT EXISTS review_batch (
     resolution   TEXT
 );
 """
+
+# Columns added to vessel_track when an older database is opened:
+#
+# * ``invalid`` marks a point that the receiving station flagged as a
+#   false report (the row is kept so the reason and the original point
+#   remain available, but it is hidden from GET /tracks and never drives
+#   a snapshot again);
+# * ``invalid_reason`` / ``invalidated_at`` hold the first reason given
+#   and the time of the first invalidation.
+_TRACK_MIGRATIONS = (
+    "ALTER TABLE vessel_track ADD COLUMN invalid INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE vessel_track ADD COLUMN invalid_reason TEXT",
+    "ALTER TABLE vessel_track ADD COLUMN invalidated_at TEXT",
+)
 
 # Existing position snapshots of an older database become one starting
 # track point per vessel; INSERT OR IGNORE makes this idempotent on
@@ -136,6 +164,18 @@ class SnapshotStore:
         self._lock = threading.Lock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            # Migration for databases created before track invalidation
+            # support: add the invalidation columns (no row is invalidated
+            # by the migration itself).
+            columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(vessel_track)"
+                ).fetchall()
+            }
+            if "invalid" not in columns:
+                for statement in _TRACK_MIGRATIONS:
+                    self._conn.execute(statement)
             # One-time migration for older databases: existing position
             # snapshots seed each vessel's track with a single starting point.
             self._conn.execute(
@@ -163,18 +203,38 @@ class SnapshotStore:
         ``vessel_track`` regardless of whether it also replaces the
         snapshot: a late older observation still enters the track, while
         ``INSERT OR IGNORE`` keeps the first saved message for an already
-        known ``(source_id, mmsi, observed_at)``. Caller must hold the
-        lock and the transaction.
+        known ``(source_id, mmsi, observed_at)``. When that slot is an
+        **invalidated** point it stays invalid and never reaches
+        ``vessel_state`` — a later submission at the same observation
+        time can neither reactivate it nor restore it as a snapshot.
+        Caller must hold the lock and the transaction.
         """
         payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
-        cursor = self._conn.execute(
-            _UPSERT_SQL, (source_id, mmsi, kind, observed_at, payload)
-        )
         if kind == KIND_POSITION:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 _INSERT_TRACK_SQL,
                 (source_id, mmsi, observed_at, sentence_index, payload),
             )
+            if cursor.rowcount == 0:
+                # A point already exists at this observed_at: keep the
+                # first saved one, and never revive an invalidated point.
+                row = self._conn.execute(
+                    "SELECT invalid FROM vessel_track "
+                    "WHERE source_id = ? AND mmsi = ? AND observed_at = ?",
+                    (source_id, mmsi, observed_at),
+                ).fetchone()
+                if row is not None and row["invalid"]:
+                    return False
+            else:
+                # brand-new track point: the upsert may still skip when a
+                # strictly newer snapshot already exists (late observation)
+                cursor = self._conn.execute(
+                    _UPSERT_SQL, (source_id, mmsi, kind, observed_at, payload)
+                )
+                return cursor.rowcount > 0
+        cursor = self._conn.execute(
+            _UPSERT_SQL, (source_id, mmsi, kind, observed_at, payload)
+        )
         return cursor.rowcount > 0
 
     def upsert_if_newer(
@@ -285,7 +345,11 @@ class SnapshotStore:
     # -- track ----------------------------------------------------------------
 
     def vessel_exists(self, source_id: str, mmsi: int) -> bool:
-        """True when the vessel has any stored snapshot or track point."""
+        """True when the vessel has any stored snapshot or valid track point.
+
+        Invalidated track points and a vessel whose position timeline was
+        removed (with only invalidated points left) do not count.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM vessel_state WHERE source_id = ? AND mmsi = ? LIMIT 1",
@@ -294,22 +358,24 @@ class SnapshotStore:
             if row is not None:
                 return True
             row = self._conn.execute(
-                "SELECT 1 FROM vessel_track WHERE source_id = ? AND mmsi = ? LIMIT 1",
+                "SELECT 1 FROM vessel_track "
+                "WHERE source_id = ? AND mmsi = ? AND invalid = 0 LIMIT 1",
                 (source_id, mmsi),
             ).fetchone()
             return row is not None
 
     def get_track(self, source_id: str, mmsi: int) -> list[TrackPoint]:
-        """All stored position reports for one vessel, oldest first.
+        """All valid position reports for one vessel, oldest first.
 
         Ordered by ``observed_at`` (then original sentence index); points
-        are stored as decoded, including null coordinates.
+        are stored as decoded, including null coordinates. Points flagged
+        as false reports are hidden but remain in storage.
         """
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT observed_at, data FROM vessel_track
-                WHERE source_id = ? AND mmsi = ?
+                WHERE source_id = ? AND mmsi = ? AND invalid = 0
                 ORDER BY observed_at, sentence_index
                 """,
                 (source_id, mmsi),
@@ -321,6 +387,125 @@ class SnapshotStore:
             )
             for row in rows
         ]
+
+    # -- track invalidation ---------------------------------------------------
+
+    def invalidate_track_point(
+        self,
+        source_id: str,
+        mmsi: int,
+        observed_at: str,
+        reason: str,
+        invalidated_at: str,
+    ) -> Optional[TrackPointInvalidation]:
+        """Mark one stored position point invalid and reconcile the snapshot.
+
+        The point addressed by ``(source_id, mmsi, observed_at)`` is flagged
+        rather than deleted, with *reason* and *invalidated_at* recorded on
+        the first invalidation only; a repeat call returns that first
+        record unchanged (the reason is never modified). When the point is
+        the vessel's live position snapshot it is rewound to the latest
+        still-valid point for the vessel, and if no valid point remains the
+        position row of ``vessel_state`` is removed (the static/voyage row
+        is independent and always kept). Flagging an older point while a
+        newer valid snapshot exists leaves that snapshot untouched. All
+        changes commit atomically. Returns ``None`` when no point is
+        stored at that key (whether valid or already invalidated does not
+        matter for the lookup — an invalidated point still returns its
+        record).
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT data, invalid, invalid_reason, invalidated_at
+                FROM vessel_track
+                WHERE source_id = ? AND mmsi = ? AND observed_at = ?
+                """,
+                (source_id, mmsi, observed_at),
+            ).fetchone()
+            if row is None:
+                return None
+            if not row["invalid"]:
+                self._conn.execute(
+                    """
+                    UPDATE vessel_track
+                    SET invalid = 1, invalid_reason = ?, invalidated_at = ?
+                    WHERE source_id = ? AND mmsi = ? AND observed_at = ?
+                    """,
+                    (reason, invalidated_at, source_id, mmsi, observed_at),
+                )
+                self._reconcile_position_snapshot(source_id, mmsi)
+                stored_reason, stored_at = reason, invalidated_at
+            else:
+                # Repeated invalidation: keep the first reason and time.
+                stored_reason = row["invalid_reason"]
+                stored_at = row["invalidated_at"]
+
+        return TrackPointInvalidation(
+            source_id=source_id,
+            mmsi=mmsi,
+            observed_at=_parse_observed_at(observed_at),
+            reason=stored_reason,
+            invalidated_at=_parse_observed_at(stored_at),
+            point=TrackPoint(
+                observed_at=_parse_observed_at(observed_at),
+                data=PositionReport(**json.loads(row["data"])),
+            ),
+        )
+
+    def _reconcile_position_snapshot(self, source_id: str, mmsi: int) -> None:
+        """Rewind/remove the position snapshot after a point was invalidated.
+
+        The live position snapshot is affected only when it points at the
+        invalidated point; it is replaced by the latest valid track point
+        of the vessel or removed when none remains. A newer valid snapshot
+        is never rolled back, and the static/voyage timeline is left
+        alone. Caller must hold the lock and the transaction.
+        """
+        state = self._conn.execute(
+            "SELECT observed_at FROM vessel_state "
+            "WHERE source_id = ? AND mmsi = ? AND kind = ?",
+            (source_id, mmsi, KIND_POSITION),
+        ).fetchone()
+        if state is None:
+            return
+        latest = self._conn.execute(
+            """
+            SELECT observed_at, data
+            FROM vessel_track
+            WHERE source_id = ? AND mmsi = ? AND invalid = 0
+            ORDER BY observed_at DESC, sentence_index DESC
+            LIMIT 1
+            """,
+            (source_id, mmsi),
+        ).fetchone()
+        if latest is None:
+            # No valid point left: drop the position timeline; the
+            # static/voyage row (if any) is independent and stays.
+            self._conn.execute(
+                "DELETE FROM vessel_state "
+                "WHERE source_id = ? AND mmsi = ? AND kind = ?",
+                (source_id, mmsi, KIND_POSITION),
+            )
+        elif latest["observed_at"] <= state["observed_at"]:
+            # The current snapshot is the invalidated point (no valid
+            # point is newer): rewind to the latest valid point.
+            self._conn.execute(
+                """
+                UPDATE vessel_state
+                SET observed_at = ?, data = ?
+                WHERE source_id = ? AND mmsi = ? AND kind = ?
+                """,
+                (
+                    latest["observed_at"],
+                    latest["data"],
+                    source_id,
+                    mmsi,
+                    KIND_POSITION,
+                ),
+            )
+        # else: a newer valid snapshot exists; flagging the older point
+        # must never roll it back, so leave vessel_state untouched.
 
     # -- review batches -------------------------------------------------------
 

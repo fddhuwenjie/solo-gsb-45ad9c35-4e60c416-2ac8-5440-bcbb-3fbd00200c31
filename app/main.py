@@ -30,6 +30,8 @@ from .models import (
     ReviewStatus,
     SentenceIn,
     Summary,
+    TrackPointInvalidation,
+    TrackPointInvalidationRequest,
     VesselSnapshot,
     VesselTrack,
 )
@@ -62,7 +64,11 @@ app = FastAPI(
         "Ambiguous batches can be stored via POST /reviews "
         "for manual review; a human picks one listed candidate per ambiguous "
         "pool and POST /reviews/{batch_id}/resolve applies the selection "
-        "to the snapshots atomically."
+        "to the snapshots atomically. A receiving station can flag a "
+        "stored position report as false via POST /tracks/invalidations: "
+        "the point is hidden from GET /tracks and the GET /vessels "
+        "snapshot is rewound to the latest still-valid point (or the "
+        "position side removed)."
     ),
 )
 
@@ -262,8 +268,8 @@ def list_vessels(source_id: Optional[str] = None, mmsi: Optional[int] = None):
     response_model=VesselTrack,
     tags=["snapshots"],
     responses={
-        200: {"description": "Stored position reports, oldest first."},
-        404: {"description": "No data for the given (source_id, MMSI)."},
+        200: {"description": "Valid stored position reports, oldest first."},
+        404: {"description": "No valid data for the given (source_id, MMSI)."},
         422: {"description": "A required query parameter is missing."},
     },
     description=(
@@ -272,7 +278,9 @@ def list_vessels(source_id: Optional[str] = None, mmsi: Optional[int] = None):
         "observed_at ascending; late (older) observations are included "
         "even though they never rolled back the GET /vessels snapshot, "
         "and a repeated submission at an already known observed_at does "
-        "not add another point. Points keep null coordinates as decoded."
+        "not add another point. Points keep null coordinates as decoded. "
+        "Points flagged as false reports via POST /tracks/invalidations "
+        "are hidden from this replay."
     ),
 )
 def get_track(source_id: str, mmsi: int):
@@ -285,6 +293,58 @@ def get_track(source_id: str, mmsi: int):
     return VesselTrack(
         source_id=source_id, mmsi=mmsi, points=store.get_track(source_id, mmsi)
     )
+
+
+@app.post(
+    "/tracks/invalidations",
+    response_model=TrackPointInvalidation,
+    tags=["snapshots"],
+    responses={
+        200: {
+            "description": (
+                "Point marked invalid (or first invalidation record "
+                "returned when it was already invalid)."
+            ),
+        },
+        404: {
+            "description": "No stored position point at that (source_id, MMSI, observed_at).",
+        },
+        422: {"description": "Request body invalid."},
+    },
+    description=(
+        "Mark one stored position report as a false report sent by a "
+        "receiving station. The point is hidden from GET /tracks and, when "
+        "it is the live GET /vessels position snapshot, that snapshot is "
+        "rewound to the latest still-valid point of the same (source_id, "
+        "MMSI) — or the position side is removed when no valid point "
+        "remains, while the static/voyage data stays. A later submission "
+        "at the same observed_at neither reactivates the point nor "
+        "restores the snapshot; flagging an older point never rolls back "
+        "a newer valid snapshot. The original point and the first reason "
+        "are returned; repeating the invalidation returns that first "
+        "record without changing the reason. The change is durable across "
+        "restarts. Pending and already resolved review batches are not "
+        "affected."
+    ),
+)
+def invalidate_track_point(request: TrackPointInvalidationRequest):
+    store = get_store()
+    invalidation = store.invalidate_track_point(
+        source_id=request.source_id,
+        mmsi=request.mmsi,
+        observed_at=normalize_observed_at(request.observed_at),
+        reason=request.reason,
+        invalidated_at=normalize_observed_at(datetime.now(timezone.utc)),
+    )
+    if invalidation is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no stored position point for source '{request.source_id}', "
+                f"MMSI {request.mmsi} at observed_at {request.observed_at.isoformat()}"
+            ),
+        )
+    return invalidation
 
 
 # ---------------------------------------------------------------------------

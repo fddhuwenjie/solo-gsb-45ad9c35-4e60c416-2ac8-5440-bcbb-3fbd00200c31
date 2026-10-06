@@ -10,6 +10,9 @@
 对无 `sequence_id` 的歧义批，`POST /reviews` 可建立**待核定批**（保存原批与各歧义池全部候选，
 不写快照），由人工核定后经 `POST /reviews/{batch_id}/resolve` 把选定候选连同本批明确解码结果
 原子写入快照；`GET /reviews` / `GET /reviews/{batch_id}` 随时查询待核定批、候选与核定结果。
+接收站发现已入库船位为误报时，`POST /tracks/invalidations` 可按 `source_id`、MMSI、
+`observed_at` 把该轨迹点标记为无效：`/tracks` 随即只回放有效点，`/vessels` 船位快照退至
+同源同船最新有效点（已无有效点则移除船位侧，静态航次保留），且后续同时间观测不会复活该点。
 
 ## 功能
 
@@ -45,6 +48,16 @@
   - 建待核定批、无效报文、缺片与**未选中候选**均不生成轨迹点；普通入库时轨迹点与快照在
     **同一事务**提交，核定时轨迹点、快照与核定状态一同成功或回滚；
   - 打开旧版数据库时，现存的每船一条船位快照自动作为该船轨迹的**唯一起点**，不推断更早航迹。
+- **误报标记（`POST /tracks/invalidations`）**：
+  - 接收站按 `(source_id, MMSI, observed_at)` 把**一条已入库船位**标为无效并记录原因，响应
+    返回该原始点；找不到该点返回 **404**，**重复标记返回首次记录（首次原因与标记时间）且不改原因**；
+  - `/tracks` 只返回有效点（无效点行不删除、仍留在库中）；若该点正是 `/vessels` 的船位快照，
+    快照**退至同源同船最新有效点**；已无有效点则**移除船位部分**，静态航次（消息 5）独立保留；
+    标记较早的点**不回滚**有效的较新快照；
+  - 标记之后，`/ingest` 与歧义批核定在该 `(source_id, MMSI, observed_at)` 再次收到船位时，
+    **不会重新激活无效点、也不会写回船位快照**；其他时间的观测仍按原有规则写入；
+  - 标记、轨迹可见性与快照回退在**同一事务**一次生效，SQLite 持久化，**重启后仍保持**；
+    待核定批与已核定记录本身不受影响，既有接口的响应合同不变。
 - **歧义批人工核定（`/reviews`）**：
   - `POST /reviews` 提交原语句与 `observed_at` 建立**待核定批**：复用同一套校验/重组/解码，
     持久保存原批与各歧义池的全部候选并返回批次 ID；**仅接受存在歧义的批次**，**建批时不写快照**；
@@ -82,7 +95,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 87 个单元/集成测试
+pytest -q          # 103 个单元/集成测试
 ```
 
 ## API
@@ -194,9 +207,10 @@ GET /tracks?source_id=ais-receiver-1&mmsi=366999999
 curl -s 'http://localhost:8000/tracks?source_id=ais-receiver-1&mmsi=366999999'
 ```
 
-轨迹按 `observed_at` **升序**返回每个成功保存的消息 1/2/3 船位；迟到的旧观测
+轨迹按 `observed_at` **升序**返回每个成功保存且仍有效的消息 1/2/3 船位；迟到的旧观测
 照样在列（即便它没有回滚 `/vessels` 最新快照），同一 `observed_at` 的重复提交
-不产生重复点，坐标 `null` 原样保留：
+不产生重复点，坐标 `null` 原样保留；被标记为误报的点不再出现（见
+`POST /tracks/invalidations`）：
 
 ```json
 {
@@ -215,9 +229,89 @@ curl -s 'http://localhost:8000/tracks?source_id=ais-receiver-1&mmsi=366999999'
 
 | 状态码 | 含义 |
 | ------ | ---- |
-| `200` | 返回轨迹（无船位点时 `points` 为 `[]`） |
-| `404` | 该 `(source_id, MMSI)` 没有任何已保存数据 |
+| `200` | 返回轨迹（无有效船位点时 `points` 为 `[]`） |
+| `404` | 该 `(source_id, MMSI)` 没有任何已保存数据（船位点全部被标记无效时若也无快照则为 404） |
 | `422` | 缺少必填查询参数 `source_id` 或 `mmsi` |
+
+> `/tracks` 只返回**有效**船位点；被 `POST /tracks/invalidations` 标为误报的点仍保留在库中，
+> 但不再出现在回放结果里。
+
+### `POST /tracks/invalidations`（标记误报船位）
+
+接收站发现某条已入库船位是误报时，按 `source_id`、`mmsi`、`observed_at` 定位该轨迹点，
+并在 `reason` 中写明原因（非空）：
+
+```bash
+curl -s -X POST http://localhost:8000/tracks/invalidations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_id": "ais-receiver-1",
+    "mmsi": 366999999,
+    "observed_at": "2026-10-05T12:00:00Z",
+    "reason": "receiving station confirmed a false position report"
+  }'
+```
+
+`observed_at` 与 `/ingest` 相同按 ISO 8601 归一化为 UTC（无时区按 UTC，带偏移换算）。
+响应 `200` 返回**原始点**以及首次标记信息：
+
+```json
+{
+  "source_id": "ais-receiver-1",
+  "mmsi": 366999999,
+  "observed_at": "2026-10-05T12:00:00Z",
+  "reason": "receiving station confirmed a false position report",
+  "invalidated_at": "2026-10-06T05:34:59.851499Z",
+  "point": {
+    "observed_at": "2026-10-05T12:00:00Z",
+    "data": { "message_type": 1, "mmsi": 366999999, "longitude": -73.98009, "latitude": 40.7484, "...": "..." }
+  }
+}
+```
+
+| 状态码 | 含义 |
+| ------ | ---- |
+| `200` | 标记成功（或该点此前已标记——重复标记返回**首次**记录，原因不变） |
+| `404` | 该 `(source_id, MMSI, observed_at)` 没有已保存的船位点 |
+| `422` | 请求体不合法（缺字段、`reason` 为空等） |
+
+标记的连带效果（标记、轨迹可见性与快照回退在同一事务内一次生效，重启后仍保持）：
+
+- **轨迹**：该点立即从 `GET /tracks` 消失（其余点与顺序不变）；
+- **快照**：若该点正是 `GET /vessels` 当前船位快照，船位侧退至**同源同船最新有效点**；
+  已无有效点则该快照的 `position` 变为 `null`，**静态航次 `static` 原样保留**；标记较早的点
+  不会回滚有效的较新快照；
+- **不复活**：此后 `/ingest`（或歧义批的迟到核定）若再收到同一 `(source_id, MMSI, observed_at)`
+  的船位，无效点不会被重新激活、也不会写回快照；其他观测时间的消息仍按原规则正常入库；
+- **核定**：待核定批与已核定记录本身不受影响（核定状态、原候选与已记录的核定结果不变）。
+
+```bash
+# 1) 先写入 11:00 与 12:00 两个船位（快照停在最新的 12:00）
+curl -s -X POST http://localhost:8000/ingest -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T11:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"}]}' >/dev/null
+curl -s -X POST http://localhost:8000/ingest -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T12:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreF9HGD@44gkg40000,0*1F"}]}' >/dev/null
+
+# 2) 12:00 被接收站确认为误报
+curl -s -X POST http://localhost:8000/tracks/invalidations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"ais-receiver-1","mmsi":366999999,
+       "observed_at":"2026-10-05T12:00:00Z","reason":"false position report"}'
+
+# 3) /tracks 只剩 11:00；/vessels 快照也退到 11:00
+curl -s 'http://localhost:8000/tracks?source_id=ais-receiver-1&mmsi=366999999'
+curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
+
+# 4) 重复标记：返回首次记录，reason 仍是第一次的内容
+curl -s -X POST http://localhost:8000/tracks/invalidations \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"ais-receiver-1","mmsi":366999999,
+       "observed_at":"2026-10-05T12:00:00Z","reason":"a later different reason"}'
+```
 
 ### `POST /reviews`（建立待核定批）
 
@@ -638,6 +732,11 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
   IGNORE` 写入，因此迟到旧观测成为轨迹中间的一点、重复提交不增点；普通入库的快照
   upsert 与轨迹 insert 在**单个事务**内完成。首次打开旧库时把 `vessel_state` 中既有的
   船位快照幂等地回填为每船**唯一起点**（`sentence_index = -1`），不推断更早航迹。
+- **误报标记**：`vessel_track` 另设 `invalid` / `invalid_reason` / `invalidated_at` 三列
+  （打开旧库时自动 `ALTER TABLE` 补齐，不改动任何已有点）；标记操作在**单个事务**内把该点
+  置无效，并在其正是当前船位快照时把 `vessel_state` 船位行回退到 `vessel_track` 中最新有效点，
+  没有有效点则删除该行（静态行独立保留）。重复标记不改任何字段，只回读首次记录。入库与核定
+  共用的写入逻辑对已无效时间槽跳过快照 upsert，因此同时间的新观测既不复活轨迹点也不写回快照。
 - **人工核定**：待核定批的原语句、解码结果（含各歧义池全部候选）与核定结果
   （`selections` + 实际写入的快照）以 JSON 持久化在同一 SQLite 库中，重启后仍可查询；
   核定时“应用全部快照与轨迹写入 + 翻转批次状态”在**单个事务**内完成——任一失败整体回滚，
@@ -647,15 +746,15 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
 
 ```
 app/
-  main.py        # FastAPI 入口，POST /decode、/ingest、/reviews、GET /vessels、/tracks、/reviews、/health
-  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹与核定批模型）
+  main.py        # FastAPI 入口，POST /decode、/ingest、/reviews、/tracks/invalidations，GET /vessels、/tracks、/reviews、/health
+  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹、误报标记与核定批模型）
   nmea.py        # NMEA 0183 语句解析与校验（XOR 校验和、分片、fill bits）
   ais.py         # 六位 armour、位提取、消息 1/2/3 与 5 解码
   assembler.py   # 归组、乱序重组、孤儿分片池歧义枚举
-  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）与核定批持久化（核定事务）
+  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填/无效列迁移）、误报标记与核定批持久化（核定事务）
 scripts/
   generate_examples.py  # 重新生成 README/测试中的示例报文
-tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序语义与人工核定流程）
+tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序、误报标记语义与人工核定流程）
 Dockerfile
 docker-compose.yml      # 命名卷 ais-data 持久化 /data/ais.db
 requirements.txt / requirements-dev.txt

@@ -238,14 +238,86 @@ class VesselTrack(BaseModel):
     Every successfully stored position report is kept — including late
     (older) observations — while the latest snapshot in ``GET /vessels``
     is never rolled back. A repeated submission at an already known
-    ``observed_at`` does not add another point.
+    ``observed_at`` does not add another point. Points that a receiving
+    station later reports as false are hidden (see
+    ``POST /tracks/invalidations``); only valid points are listed.
     """
 
     source_id: str
     mmsi: int
     points: list[TrackPoint] = Field(
-        ..., description="Position reports ordered by observed_at ascending."
+        ..., description="Valid position reports ordered by observed_at ascending."
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual invalidation of false position reports
+# ---------------------------------------------------------------------------
+
+class TrackPointInvalidationRequest(BaseModel):
+    """Identify one stored position point to be marked invalid.
+
+    The point is addressed by its ``(source_id, mmsi, observed_at)`` key;
+    ``reason`` records why the receiving station considers it a false
+    report and is kept with the first invalidation only.
+    """
+
+    source_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="Identifier of the receiver/source that produced the report.",
+        examples=["ais-receiver-1"],
+    )
+    mmsi: int = Field(
+        ...,
+        description="MMSI of the vessel whose position report is false.",
+        examples=[366999999],
+    )
+    observed_at: datetime = Field(
+        ...,
+        description=(
+            "UTC observation time of the point to invalidate (ISO 8601). "
+            "Naive values are treated as UTC; offsets are converted to UTC."
+        ),
+        examples=["2026-10-05T12:00:00Z"],
+    )
+    reason: str = Field(
+        ..., min_length=1, max_length=512,
+        description="Why the report is considered false; recorded on first invalidation only.",
+        examples=["receiving station confirmed a false position report"],
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("reason must not be blank")
+        return stripped
+
+    @field_validator("observed_at")
+    @classmethod
+    def _assume_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+
+class TrackPointInvalidation(BaseModel):
+    """Result of invalidating one position point.
+
+    The original point is returned (it stays in storage but is hidden
+    from ``GET /tracks`` and never drives ``GET /vessels`` again). A
+    repeated invalidation returns the first record, including its
+    original ``reason`` and ``invalidated_at``.
+    """
+
+    source_id: str
+    mmsi: int
+    observed_at: datetime
+    reason: str = Field(..., description="Stored reason (always the first one given).")
+    invalidated_at: datetime = Field(
+        ..., description="UTC time of the first invalidation.")
+    point: TrackPoint = Field(..., description="The original stored position point.")
 
 
 # ---------------------------------------------------------------------------
